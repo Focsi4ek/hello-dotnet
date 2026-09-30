@@ -1,0 +1,132 @@
+name: .NET CI/CD
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  DOTNET_NOLOGO: '1'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore HelloDotnet.sln
+
+      - name: Check formatting
+        run: dotnet format HelloDotnet.sln --verify-no-changes --no-restore
+
+      - name: Build
+        run: dotnet build HelloDotnet.sln --configuration Release --no-restore --warnaserror
+
+      - name: Run tests
+        run: dotnet test HelloDotnet.sln --configuration Release --no-build --logger "console;verbosity=normal"
+
+  build:
+    needs: test
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            rid: linux-x64
+            original: hello-dotnet
+            asset: hello-dotnet-linux-x64
+          - os: macos-15
+            rid: osx-arm64
+            original: hello-dotnet
+            asset: hello-dotnet-macos-arm64
+          - os: windows-2022
+            rid: win-x64
+            original: hello-dotnet.exe
+            asset: hello-dotnet-windows-x64.exe
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish binary
+        env:
+          TARGET_RID: ${{ matrix.rid }}
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          dotnet publish src/HelloDotnet/HelloDotnet.csproj \
+            --configuration Release \
+            --runtime "$TARGET_RID" \
+            --self-contained true \
+            --output dist \
+            -p:PublishSingleFile=true \
+            -p:IncludeNativeLibrariesForSelfExtract=true \
+            -p:DebugType=None \
+            -p:DebugSymbols=false \
+            -p:Version="${RELEASE_VERSION#v}" \
+            -p:InformationalVersion="$RELEASE_VERSION" \
+            -p:IncludeSourceRevisionInInformationalVersion=false
+
+      - name: Rename and test binary
+        env:
+          ORIGINAL_NAME: ${{ matrix.original }}
+          ASSET_NAME: ${{ matrix.asset }}
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          mv "dist/$ORIGINAL_NAME" "dist/$ASSET_NAME"
+          chmod +x "dist/$ASSET_NAME"
+
+          output="$("./dist/$ASSET_NAME" CI)"
+          printf '%s\n' "$output"
+
+          printf '%s\n' "$output" | tr -d '\r' | grep -Fx "hello-dotnet version $RELEASE_VERSION"
+          printf '%s\n' "$output" | tr -d '\r' | grep -Fx "Sum 1..10 = 55"
+          printf '%s\n' "$output" | tr -d '\r' | grep -Fx "  1: CI"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v5
+        with:
+          path: dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/**/hello-dotnet-*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
